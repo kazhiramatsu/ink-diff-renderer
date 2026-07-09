@@ -357,9 +357,12 @@ export class ScrollbackTerminal {
   }
 
   private flush(): void {
-    if (this.destroyed || this.isResizing) return;
-    
+    // Always clear the pending flag first: if a resize starts between
+    // scheduleRender() and flush(), returning with pendingRender still true
+    // would block every future scheduleRender() call permanently.
     this.pendingRender = false;
+    if (this.destroyed || this.isResizing) return;
+
     this.lastRenderTime = Date.now();
     this.renderInputArea();
   }

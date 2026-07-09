@@ -20,6 +20,11 @@ export class DiffRenderer {
   private currentStyle: Style = EMPTY_STYLE;
   private cursorX = 0;
   private cursorY = 0;
+  // False when the tracked position may not match the real cursor (after
+  // writing through the last column the terminal enters pending-wrap state,
+  // where the physical cursor stays on the last column). Forces the next
+  // movement to use absolute positioning, which is wrap-state independent.
+  private cursorKnown = true;
   private isFirstRender = true;
 
   constructor(width: number, height: number) {
@@ -136,11 +141,19 @@ export class DiffRenderer {
       parts.push(cell.char);
       this.cursorX += cell.width;
     }
-    
+
+    if (this.cursorX >= this.width) {
+      this.cursorKnown = false;
+    }
+
     return parts.join('');
   }
 
   private moveCursor(x: number, y: number): string {
+    if (!this.cursorKnown) {
+      return this.moveCursorAbsolute(x, y);
+    }
+
     if (x === this.cursorX && y === this.cursorY) {
       return '';
     }
@@ -187,6 +200,7 @@ export class DiffRenderer {
   private moveCursorAbsolute(x: number, y: number): string {
     this.cursorX = x;
     this.cursorY = y;
+    this.cursorKnown = true;
     return `\x1b[${y + 1};${x + 1}H`;
   }
 
@@ -244,6 +258,10 @@ export class DiffRenderer {
     // Reset style
     parts.push('\x1b[0m');
     this.currentStyle = EMPTY_STYLE;
+
+    if (this.cursorX >= this.width) {
+      this.cursorKnown = false;
+    }
 
     // Move native cursor to input position (for IME support)
     const cursorPos = this.buffer.getCursorPosition();

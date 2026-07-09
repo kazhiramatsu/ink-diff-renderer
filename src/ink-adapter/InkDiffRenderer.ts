@@ -6,7 +6,6 @@
 import { Terminal, TerminalOptions } from '../terminal/Terminal';
 import { ScreenBuffer } from '../terminal/ScreenBuffer';
 import { Style, EMPTY_STYLE } from '../terminal/Style';
-import stringWidth from 'string-width';
 
 interface ParsedLine {
   segments: Array<{
@@ -26,6 +25,7 @@ export interface InkDiffRendererOptions extends TerminalOptions {
 export class InkDiffRenderer {
   private terminal: Terminal;
   private stripAnsi: boolean;
+  private stdout: NodeJS.WriteStream;
 
   constructor(options: InkDiffRendererOptions = {}) {
     this.terminal = new Terminal({
@@ -33,6 +33,7 @@ export class InkDiffRenderer {
       altScreen: options.altScreen ?? true,
     });
     this.stripAnsi = options.stripAnsi ?? false;
+    this.stdout = options.stdout ?? process.stdout;
   }
 
   /**
@@ -59,17 +60,17 @@ export class InkDiffRenderer {
   render(output: string): void {
     const buffer = this.terminal.getBuffer();
     buffer.clear();
-    
+
     this.parseAndRender(buffer, output);
-    
+
     const renderer = this.terminal.getRenderer();
+    // renderer.render() swaps the buffers itself — swapping again here would
+    // leave the back buffer empty, so vanished cells would never be erased.
     const rendered = renderer.render();
-    
+
     if (rendered.length > 0) {
-      process.stdout.write(rendered);
+      this.stdout.write(rendered);
     }
-    
-    buffer.swap();
   }
 
   /**
@@ -85,44 +86,50 @@ export class InkDiffRenderer {
 
   private parseAndRender(buffer: ScreenBuffer, output: string): void {
     const lines = output.split('\n');
-    
+
     let currentStyle: Style = {};
-    
+
     for (let y = 0; y < Math.min(lines.length, buffer.height); y++) {
       const line = lines[y];
       let x = 0;
       let i = 0;
-      
-      while (i < line.length && x < buffer.width) {
+      let run = '';
+
+      // Write the pending text run with the current style. ScreenBuffer.write
+      // splits by grapheme and measures display width, so surrogate pairs
+      // (emoji) and combining characters stay intact — iterating UTF-16 code
+      // units here would tear them apart.
+      const flushRun = () => {
+        if (run.length === 0) return;
+        x = buffer.write(x, y, run, { style: currentStyle }).x;
+        run = '';
+      };
+
+      while (i < line.length) {
         // Parse ANSI escape sequences
         if (line[i] === '\x1b' && line[i + 1] === '[') {
           const match = line.slice(i).match(/^\x1b\[([0-9;]*)m/);
           if (match) {
+            flushRun();
             currentStyle = this.parseAnsiCodes(match[1], currentStyle);
             i += match[0].length;
             continue;
           }
-          
+
           // Skip other escape sequences
           const otherMatch = line.slice(i).match(/^\x1b\[[0-9;]*[A-Za-z]/);
           if (otherMatch) {
+            flushRun();
             i += otherMatch[0].length;
             continue;
           }
         }
-        
-        // Handle regular character
-        if (line[i] !== undefined) {
-          const char = line[i];
-          const charWidth = stringWidth(char);
-          
-          if (x + charWidth <= buffer.width) {
-            buffer.write(x, y, char, { style: currentStyle });
-            x += charWidth;
-          }
-        }
+
+        run += line[i];
         i++;
       }
+
+      flushRun();
     }
   }
 
@@ -234,19 +241,28 @@ export function createDiffOutputStream(options: InkDiffRendererOptions = {}): {
 } {
   const renderer = new InkDiffRenderer(options);
   let buffer = '';
-  
-  // Create a fake write stream
-  const stream = {
-    write(data: string | Buffer): boolean {
-      const str = typeof data === 'string' ? data : data.toString();
-      buffer += str;
-      
-      // Check if we have a complete frame (ends with newline or specific pattern)
-      if (str.includes('\n') || str.includes('\x1b[')) {
+  let flushScheduled = false;
+
+  // Batch all writes from the same tick into one frame. Ink emits a complete
+  // frame per render, but it may arrive split across several write() calls —
+  // rendering each chunk as it arrives would paint partial frames.
+  const scheduleFlush = () => {
+    if (flushScheduled) return;
+    flushScheduled = true;
+    setImmediate(() => {
+      flushScheduled = false;
+      if (buffer.length > 0) {
         renderer.render(buffer);
         buffer = '';
       }
-      
+    });
+  };
+
+  // Create a fake write stream
+  const stream = {
+    write(data: string | Buffer): boolean {
+      buffer += typeof data === 'string' ? data : data.toString();
+      scheduleFlush();
       return true;
     },
     
